@@ -1,0 +1,681 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="1.0.0"
+CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
+LOG_FILE="${CODEX_CLAUDE_BRIDGE_LOG:-$CODEX_HOME_DIR/log/claude-bridge.jsonl}"
+REPORT_CMD="${CODEX_CLAUDE_BRIDGE_REPORT_CMD:-}"
+REPORT_REPO="${CODEX_CLAUDE_BRIDGE_REPORT_REPO:-}"
+DEFAULT_CLAUDE_TIMEOUT_SEC="${CODEX_CLAUDE_BRIDGE_TIMEOUT_SEC:-1800}"
+REPORT_TIMEOUT_SEC="${CODEX_CLAUDE_BRIDGE_REPORT_TIMEOUT_SEC:-25}"
+TRADE_REVIEW_MIN_TIMEOUT_SEC="${CODEX_CLAUDE_BRIDGE_TRADE_REVIEW_MIN_TIMEOUT_SEC:-900}"
+
+usage() {
+  cat <<'EOF'
+codex-claude-bridge 1.0.0
+
+Usage:
+  codex-claude-bridge ask [options] "question"
+  codex-claude-bridge review [options] "review request"
+  codex-claude-bridge trade-review [options] "trading-system review request"
+  codex-claude-bridge doctor [--json] [--no-report-log]
+  codex-claude-bridge status [--json]
+  codex-claude-bridge last [--json|--result-only]
+
+Options:
+  --mode consult|review|delegate
+  --model auto|haiku|sonnet|opus
+  --effort auto|low|medium|high|max
+  --cwd PATH
+  --add-dir PATH              May be repeated.
+  --timeout-sec N             Claude timeout; 0 disables. Default: 1800.
+  --timeout-sec values below 900 are raised for trade-review unless
+                              CODEX_CLAUDE_BRIDGE_TRADE_REVIEW_MIN_TIMEOUT_SEC is changed.
+  --report-timeout-sec N      Report logging timeout. Default: 25.
+  --json                      Print bridge metadata as JSON.
+  --no-report-log             Skip report logging.
+  -h, --help
+
+Design:
+  Codex remains the primary operator. Claude is called only through
+  non-interactive "claude -p --output-format json".
+EOF
+}
+
+die() {
+  printf 'codex-claude-bridge: %s\n' "$*" >&2
+  exit 2
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+now_utc() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+validate_choice() {
+  local name="$1" value="$2" allowed="$3"
+  case " $allowed " in
+    *" $value "*) ;;
+    *) die "invalid $name: $value (allowed: $allowed)" ;;
+  esac
+}
+
+validate_seconds() {
+  local name="$1" value="$2"
+  case "$value" in
+    ''|*[!0-9]*) die "$name must be a non-negative integer: $value" ;;
+  esac
+}
+
+effective_claude_timeout() {
+  local requested="$1" command_name="$2" min_timeout
+  min_timeout="$TRADE_REVIEW_MIN_TIMEOUT_SEC"
+  case "$min_timeout" in
+    ''|*[!0-9]*) min_timeout=900 ;;
+  esac
+  if [ "$command_name" = "trade-review" ] && [ "$requested" -gt 0 ] && [ "$requested" -lt "$min_timeout" ]; then
+    printf '%s\n' "$min_timeout"
+  else
+    printf '%s\n' "$requested"
+  fi
+}
+
+default_mode_for() {
+  case "$1" in
+    ask) printf 'consult' ;;
+    review|trade-review) printf 'review' ;;
+    *) printf 'consult' ;;
+  esac
+}
+
+read_prompt() {
+  local joined="" stdin_payload=""
+  if [ "$#" -gt 0 ]; then
+    joined="$*"
+  fi
+  if [ ! -t 0 ]; then
+    stdin_payload="$(cat || true)"
+  fi
+  if [ -n "$stdin_payload" ] && [ -n "$joined" ]; then
+    printf '%s\n\n<stdin>\n%s\n</stdin>\n' "$joined" "$stdin_payload"
+  elif [ -n "$stdin_payload" ]; then
+    printf '%s\n' "$stdin_payload"
+  else
+    printf '%s\n' "$joined"
+  fi
+}
+
+is_high_risk_text() {
+  local text
+  text="$(printf '%s' "$*" | tr '[:upper:]' '[:lower:]')"
+  case "$text" in
+    *trade*|*trading*|*order*|*position*|*leverage*|*risk*|*backtest*|*strategy*|*fund*|*capital*|*live_blocked*|*交易*|*實盤*|*风控*|*風控*|*下單*|*資金*|*仓位*|*倉位*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+choose_model() {
+  local requested="$1" command_name="$2" mode="$3" prompt="$4"
+  if [ "$requested" != "auto" ]; then
+    printf '%s\n' "$requested"
+  elif [ "$mode" = "delegate" ] || [ "$command_name" = "trade-review" ] || is_high_risk_text "$prompt"; then
+    printf 'opus\n'
+  elif [ "$command_name" = "review" ] || [ "$mode" = "review" ]; then
+    printf 'sonnet\n'
+  elif [ "${#prompt}" -lt 900 ]; then
+    printf 'haiku\n'
+  else
+    printf 'sonnet\n'
+  fi
+}
+
+choose_effort() {
+  local requested="$1" command_name="$2" mode="$3" model="$4" prompt="$5"
+  if [ "$requested" != "auto" ]; then
+    printf '%s\n' "$requested"
+  elif [ "$mode" = "delegate" ] || [ "$command_name" = "trade-review" ] || [ "$model" = "opus" ] || is_high_risk_text "$prompt"; then
+    printf 'max\n'
+  elif [ "$command_name" = "review" ] || [ "$mode" = "review" ]; then
+    printf 'high\n'
+  elif [ "$model" = "haiku" ]; then
+    printf 'low\n'
+  else
+    printf 'medium\n'
+  fi
+}
+
+run_with_stdin_timeout() {
+  local timeout_sec="$1" stdin_file="$2" stdout_file="$3" stderr_file="$4" cwd="$5"
+  shift 5
+  python3 - "$timeout_sec" "$stdin_file" "$stdout_file" "$stderr_file" "$cwd" "$@" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+timeout = int(sys.argv[1])
+stdin_path, stdout_path, stderr_path, cwd = sys.argv[2:6]
+args = sys.argv[6:]
+
+with open(stdin_path, "rb") as stdin, open(stdout_path, "ab") as stdout, open(stderr_path, "ab") as stderr:
+    try:
+        proc = subprocess.Popen(args, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, start_new_session=True)
+    except Exception as exc:
+        stderr.write(f"Failed to start command: {exc}\n".encode("utf-8", "replace"))
+        sys.exit(127)
+
+    try:
+        sys.exit(proc.wait(timeout=None if timeout <= 0 else timeout))
+    except subprocess.TimeoutExpired:
+        stderr.write(f"\nTimed out after {timeout} seconds: {args[0] if args else 'command'}\n".encode("utf-8", "replace"))
+        stderr.flush()
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        sys.exit(124)
+PY
+}
+
+repo_context() {
+  local cwd="$1"
+  if ! git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf 'No git repository detected at cwd.\n'
+    return
+  fi
+  printf 'Git root: '
+  git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true
+  printf '\nGit status --short:\n'
+  git -C "$cwd" status --short 2>/dev/null | head -n 200 || true
+  printf '\nGit diff --stat:\n'
+  git -C "$cwd" diff --stat 2>/dev/null | head -n 200 || true
+  printf '\nGit diff --cached --stat:\n'
+  git -C "$cwd" diff --cached --stat 2>/dev/null | head -n 200 || true
+}
+
+build_prompt() {
+  local command_name="$1" mode="$2" cwd="$3" prompt="$4" context=""
+  case "$command_name" in
+    review|trade-review) context="$(repo_context "$cwd")" ;;
+  esac
+  cat <<EOF
+You are Claude acting as a secondary assistant for Codex.
+
+Codex is the primary operator and final decision maker. Your job is to provide a high-signal second opinion, critique, risk review, or implementation advice. Do not claim final authority. Do not place trades, transfer funds, expose secrets, or perform destructive actions.
+
+Bridge command: $command_name
+Bridge mode: $mode
+Working directory: $cwd
+
+User request:
+$prompt
+
+Repository context:
+$context
+
+Output expectations:
+- Start with a one-line verdict.
+- Prioritize concrete bugs, risks, missing tests, and false assumptions.
+- Include exact files/commands only when useful.
+- If tools are available, use them sparingly and keep the work bounded.
+- In consult/review mode, do not modify files; provide findings and patch suggestions only.
+- In delegate mode, still prefer producing a clear patch plan unless the prompt explicitly asks you to edit.
+EOF
+}
+
+claude_tool_args() {
+  local mode="$1"
+  case "$mode" in
+    consult)
+      printf '%s\0' --tools ""
+      ;;
+    review)
+      printf '%s\0' --tools "Read,Glob,Grep,Bash"
+      printf '%s\0' --allowedTools "Read,Glob,Grep,Bash(git *),Bash(rg *),Bash(ls *),Bash(find *),Bash(cat *),Bash(sed *),Bash(nl *),Bash(wc *),Bash(test *),Bash(pytest *),Bash(python -m pytest *),Bash(npm test *),Bash(npm run test *),Bash(swift test *),Bash(cargo test *),Bash(go test *)"
+      printf '%s\0' --disallowedTools "Edit,Write,MultiEdit,NotebookEdit"
+      printf '%s\0' --permission-mode bypassPermissions
+      ;;
+    delegate)
+      printf '%s\0' --tools default
+      printf '%s\0' --permission-mode bypassPermissions
+      printf '%s\0' --dangerously-skip-permissions
+      ;;
+  esac
+}
+
+json_field() {
+  local file="$1" field="$2" default_value="${3:-}"
+  python3 - "$file" "$field" "$default_value" <<'PY'
+import json
+import sys
+path, field, default = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    data = json.load(open(path, "r", encoding="utf-8"))
+    value = data
+    for part in field.split("."):
+        value = value[part]
+    print(json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else (default if value is None else value))
+except Exception:
+    print(default)
+PY
+}
+
+write_local_log() {
+  local out_file="$1" err_file="$2" status="$3" command_name="$4" mode="$5" model="$6" effort="$7" cwd="$8" prompt="$9" started_at="${10}" ended_at="${11}"
+  mkdir -p "$(dirname "$LOG_FILE")"
+  BRIDGE_OUT_FILE="$out_file" \
+  BRIDGE_ERR_FILE="$err_file" \
+  BRIDGE_STATUS="$status" \
+  BRIDGE_COMMAND="$command_name" \
+  BRIDGE_MODE="$mode" \
+  BRIDGE_MODEL="$model" \
+  BRIDGE_EFFORT="$effort" \
+  BRIDGE_CWD="$cwd" \
+  BRIDGE_PROMPT="$prompt" \
+  BRIDGE_STARTED_AT="$started_at" \
+  BRIDGE_ENDED_AT="$ended_at" \
+  python3 - "$LOG_FILE" <<'PY'
+import json
+import os
+import sys
+
+raw = open(os.environ["BRIDGE_OUT_FILE"], "r", encoding="utf-8", errors="replace").read()
+stderr = open(os.environ["BRIDGE_ERR_FILE"], "r", encoding="utf-8", errors="replace").read()
+try:
+    parsed = json.loads(raw) if raw.strip() else {}
+except Exception:
+    parsed = {}
+entry = {
+    "ts": os.environ["BRIDGE_ENDED_AT"],
+    "started_at": os.environ["BRIDGE_STARTED_AT"],
+    "command": os.environ["BRIDGE_COMMAND"],
+    "mode": os.environ["BRIDGE_MODE"],
+    "model_requested": os.environ["BRIDGE_MODEL"],
+    "effort": os.environ["BRIDGE_EFFORT"],
+    "cwd": os.environ["BRIDGE_CWD"],
+    "exit_status": int(os.environ["BRIDGE_STATUS"]),
+    "claude_session_id": parsed.get("session_id"),
+    "claude_subtype": parsed.get("subtype"),
+    "claude_model_usage": parsed.get("modelUsage"),
+    "claude_total_cost_usd": parsed.get("total_cost_usd"),
+    "claude_duration_ms": parsed.get("duration_ms"),
+    "prompt_preview": os.environ["BRIDGE_PROMPT"][:1500],
+    "result": str(parsed.get("result", raw))[:20000],
+    "stderr": stderr[:8000],
+}
+with open(sys.argv[1], "a", encoding="utf-8") as f:
+    f.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+PY
+}
+
+report_is_configured() {
+  [ -n "$REPORT_CMD" ] && [ -x "$REPORT_CMD" ] && [ -n "$REPORT_REPO" ] && [ -d "$REPORT_REPO" ]
+}
+
+write_report_log() {
+  local out_file="$1" err_file="$2" status="$3" command_name="$4" mode="$5" model="$6" effort="$7" cwd="$8" prompt="$9" started_at="${10}" ended_at="${11}"
+  report_is_configured || return 0
+
+  local report_file title report_stdout report_stderr
+  report_file="$(mktemp "${TMPDIR:-/tmp}/codex-claude-bridge-report.XXXXXX.md")"
+  title="Codex Claude Bridge ${command_name} ${ended_at}"
+  BRIDGE_OUT_FILE="$out_file" BRIDGE_ERR_FILE="$err_file" BRIDGE_STATUS="$status" BRIDGE_COMMAND="$command_name" BRIDGE_MODE="$mode" BRIDGE_MODEL="$model" BRIDGE_EFFORT="$effort" BRIDGE_CWD="$cwd" BRIDGE_PROMPT="$prompt" BRIDGE_STARTED_AT="$started_at" BRIDGE_ENDED_AT="$ended_at" python3 - > "$report_file" <<'PY'
+import json
+import os
+raw = open(os.environ["BRIDGE_OUT_FILE"], "r", encoding="utf-8", errors="replace").read()
+stderr = open(os.environ["BRIDGE_ERR_FILE"], "r", encoding="utf-8", errors="replace").read()
+try:
+    parsed = json.loads(raw) if raw.strip() else {}
+except Exception:
+    parsed = {}
+result = str(parsed.get("result", raw))
+usage = parsed.get("modelUsage") or {}
+print("# Codex Claude Bridge Report\n")
+for key in ["BRIDGE_STARTED_AT", "BRIDGE_ENDED_AT", "BRIDGE_COMMAND", "BRIDGE_MODE", "BRIDGE_MODEL", "BRIDGE_EFFORT", "BRIDGE_CWD", "BRIDGE_STATUS"]:
+    print(f"- {key.replace('BRIDGE_', '').replace('_', ' ').title()}: {os.environ[key]}")
+print(f"- Claude session: {parsed.get('session_id')}")
+print(f"- Cost USD: {parsed.get('total_cost_usd')}")
+print("\n## Prompt Preview\n")
+print(os.environ["BRIDGE_PROMPT"][:3000])
+print("\n## Claude Result\n")
+print(result[:12000])
+if usage:
+    print("\n## Model Usage\n\n```json")
+    print(json.dumps(usage, ensure_ascii=False, indent=2)[:6000])
+    print("```")
+if stderr.strip():
+    print("\n## Stderr\n\n```")
+    print(stderr[:4000])
+    print("```")
+PY
+  report_stdout="$(mktemp "${TMPDIR:-/tmp}/codex-claude-bridge-report.XXXXXX.out")"
+  report_stderr="$(mktemp "${TMPDIR:-/tmp}/codex-claude-bridge-report.XXXXXX.err")"
+  run_with_stdin_timeout "$REPORT_TIMEOUT_SEC" "$report_file" "$report_stdout" "$report_stderr" "$(pwd)" "$REPORT_CMD" report --type codex-claude-bridge --title "$title" --dir "$REPORT_REPO" >/dev/null 2>&1 || true
+  rm -f "$report_file" "$report_stdout" "$report_stderr"
+}
+
+emit_bridge_json() {
+  local out_file="$1" err_file="$2" status="$3" command_name="$4" mode="$5" model="$6" effort="$7" cwd="$8" started_at="$9" ended_at="${10}"
+  BRIDGE_OUT_FILE="$out_file" BRIDGE_ERR_FILE="$err_file" BRIDGE_STATUS="$status" BRIDGE_COMMAND="$command_name" BRIDGE_MODE="$mode" BRIDGE_MODEL="$model" BRIDGE_EFFORT="$effort" BRIDGE_CWD="$cwd" BRIDGE_STARTED_AT="$started_at" BRIDGE_ENDED_AT="$ended_at" BRIDGE_LOG_FILE="$LOG_FILE" BRIDGE_VERSION="$VERSION" python3 - <<'PY'
+import json
+import os
+raw = open(os.environ["BRIDGE_OUT_FILE"], "r", encoding="utf-8", errors="replace").read()
+stderr = open(os.environ["BRIDGE_ERR_FILE"], "r", encoding="utf-8", errors="replace").read()
+try:
+    claude = json.loads(raw) if raw.strip() else {}
+except Exception:
+    claude = {"raw": raw}
+payload = {
+    "bridge": "codex-claude-bridge",
+    "version": os.environ["BRIDGE_VERSION"],
+    "started_at": os.environ["BRIDGE_STARTED_AT"],
+    "ended_at": os.environ["BRIDGE_ENDED_AT"],
+    "command": os.environ["BRIDGE_COMMAND"],
+    "mode": os.environ["BRIDGE_MODE"],
+    "model": os.environ["BRIDGE_MODEL"],
+    "effort": os.environ["BRIDGE_EFFORT"],
+    "cwd": os.environ["BRIDGE_CWD"],
+    "exit_status": int(os.environ["BRIDGE_STATUS"]),
+    "log_file": os.environ["BRIDGE_LOG_FILE"],
+    "claude": claude,
+    "stderr": stderr,
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+}
+
+emit_plain_result() {
+  local out_file="$1" err_file="$2" status="$3"
+  if [ "$status" -eq 0 ]; then
+    json_field "$out_file" result "$(cat "$out_file")"
+  else
+    printf 'Claude bridge failed with exit status %s\n' "$status" >&2
+    [ -s "$err_file" ] && cat "$err_file" >&2
+    [ -s "$out_file" ] && cat "$out_file" >&2
+  fi
+}
+
+run_doctor() {
+  local output_json=0 report_log=1 cwd claude_timeout started_at ended_at claude_out claude_err claude_prompt claude_status codex_status report_status report_skipped
+  cwd="$(pwd)"
+  claude_timeout="$DEFAULT_CLAUDE_TIMEOUT_SEC"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) output_json=1; shift ;;
+      --no-report-log) report_log=0; shift ;;
+      --cwd) cwd="${2:-}"; [ -n "$cwd" ] || die "--cwd requires a path"; shift 2 ;;
+      --timeout-sec) claude_timeout="${2:-}"; validate_seconds timeout-sec "$claude_timeout"; shift 2 ;;
+      --report-timeout-sec) REPORT_TIMEOUT_SEC="${2:-}"; validate_seconds report-timeout-sec "$REPORT_TIMEOUT_SEC"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown doctor option: $1" ;;
+    esac
+  done
+  started_at="$(now_utc)"
+  claude_out="$(mktemp "${TMPDIR:-/tmp}/codex-claude-bridge-doctor-claude.XXXXXX.json")"
+  claude_err="$(mktemp "${TMPDIR:-/tmp}/codex-claude-bridge-doctor-claude.XXXXXX.err")"
+  claude_prompt="$(mktemp "${TMPDIR:-/tmp}/codex-claude-bridge-doctor-prompt.XXXXXX.txt")"
+  printf '%s\n' "Reply with exactly BRIDGE_DOCTOR_OK." > "$claude_prompt"
+  need_cmd claude
+  need_cmd codex
+  need_cmd python3
+  run_with_stdin_timeout "$claude_timeout" "$claude_prompt" "$claude_out" "$claude_err" "$cwd" claude -p --model haiku --effort low --output-format json --tools "" --no-session-persistence || claude_status=$?
+  claude_status="${claude_status:-0}"
+  codex --version >/dev/null 2>&1 && codex_status=0 || codex_status=$?
+  report_status=0
+  report_skipped=1
+  if [ "$report_log" -eq 1 ] && report_is_configured; then
+    report_skipped=0
+    local report_doctor_in report_doctor_out report_doctor_err
+    report_doctor_in="$(mktemp "${TMPDIR:-/tmp}/codex-claude-bridge-report-doctor.XXXXXX.md")"
+    report_doctor_out="$(mktemp "${TMPDIR:-/tmp}/codex-claude-bridge-report-doctor.XXXXXX.out")"
+    report_doctor_err="$(mktemp "${TMPDIR:-/tmp}/codex-claude-bridge-report-doctor.XXXXXX.err")"
+    printf '# Codex Claude Bridge Doctor\n\nDoctor ran at %s.\n' "$started_at" > "$report_doctor_in"
+    run_with_stdin_timeout "$REPORT_TIMEOUT_SEC" "$report_doctor_in" "$report_doctor_out" "$report_doctor_err" "$(pwd)" "$REPORT_CMD" report --type codex-claude-bridge --title "Codex Claude Bridge Doctor $started_at" --dir "$REPORT_REPO" >/dev/null 2>&1 || report_status=$?
+    rm -f "$report_doctor_in" "$report_doctor_out" "$report_doctor_err"
+  fi
+  ended_at="$(now_utc)"
+  if [ "$output_json" -eq 1 ]; then
+    BRIDGE_CLAUDE_OUT="$claude_out" BRIDGE_CLAUDE_ERR="$claude_err" BRIDGE_CLAUDE_STATUS="$claude_status" BRIDGE_CODEX_STATUS="$codex_status" BRIDGE_REPORT_STATUS="$report_status" BRIDGE_REPORT_SKIPPED="$report_skipped" BRIDGE_STARTED_AT="$started_at" BRIDGE_ENDED_AT="$ended_at" BRIDGE_REPORT_CMD="$REPORT_CMD" BRIDGE_REPORT_REPO="$REPORT_REPO" BRIDGE_VERSION="$VERSION" python3 - <<'PY'
+import json
+import os
+out = open(os.environ["BRIDGE_CLAUDE_OUT"], "r", encoding="utf-8", errors="replace").read()
+err = open(os.environ["BRIDGE_CLAUDE_ERR"], "r", encoding="utf-8", errors="replace").read()
+try:
+    parsed = json.loads(out) if out.strip() else {}
+except Exception:
+    parsed = {"raw": out}
+result = str(parsed.get("result", ""))
+payload = {
+    "bridge": "codex-claude-bridge",
+    "version": os.environ["BRIDGE_VERSION"],
+    "started_at": os.environ["BRIDGE_STARTED_AT"],
+    "ended_at": os.environ["BRIDGE_ENDED_AT"],
+    "checks": {
+        "claude_print_json": {"ok": os.environ["BRIDGE_CLAUDE_STATUS"] == "0" and result.strip() == "BRIDGE_DOCTOR_OK", "status": int(os.environ["BRIDGE_CLAUDE_STATUS"]), "result": result, "stderr": err},
+        "codex_cli": {"ok": os.environ["BRIDGE_CODEX_STATUS"] == "0", "status": int(os.environ["BRIDGE_CODEX_STATUS"])},
+        "report_log": {"ok": os.environ["BRIDGE_REPORT_SKIPPED"] == "1" or os.environ["BRIDGE_REPORT_STATUS"] == "0", "skipped": os.environ["BRIDGE_REPORT_SKIPPED"] == "1", "status": None if os.environ["BRIDGE_REPORT_SKIPPED"] == "1" else int(os.environ["BRIDGE_REPORT_STATUS"]), "binary": os.environ.get("BRIDGE_REPORT_CMD") or None, "repo": os.environ.get("BRIDGE_REPORT_REPO") or None},
+    },
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+  else
+    printf 'claude -p json: %s\n' "$claude_status"
+    printf 'codex cli: %s\n' "$codex_status"
+    printf 'report log: %s\n' "$report_status"
+    json_field "$claude_out" result ""
+  fi
+  rm -f "$claude_out" "$claude_err" "$claude_prompt"
+  [ "$claude_status" -eq 0 ] && [ "$codex_status" -eq 0 ] && { [ "$report_skipped" -eq 1 ] || [ "$report_status" -eq 0 ]; }
+}
+
+run_status() {
+  local output_json=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) output_json=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown status option: $1" ;;
+    esac
+  done
+  local active latest_log latest_report report_count report_dir
+  active="$(ps -axo pid=,ppid=,stat=,etime=,command= | python3 -c '
+import re
+import sys
+
+for line in sys.stdin:
+    parts = line.strip().split(None, 4)
+    if len(parts) < 5:
+        continue
+    pid, ppid, stat, elapsed, command = parts
+    label = None
+    lowered = command.lower()
+    if "codex-claude-bridge" in command:
+        label = "codex-claude-bridge"
+    elif re.search(r"(^|[/\s])claude\s+-p(\s|$)", command):
+        label = "claude -p"
+    elif re.search(r"(^|[/\s])claude\s+doctor(\s|$)", command):
+        label = "claude doctor"
+    elif re.search(r"report.*serve", lowered):
+        label = "report serve"
+    if label:
+        print(f"{pid} {ppid} {stat} {elapsed} {label}")
+')"
+  latest_log="$(tail -n 1 "$LOG_FILE" 2>/dev/null || true)"
+  report_dir=""
+  latest_report=""
+  report_count="0"
+  if [ -n "$REPORT_REPO" ]; then
+    report_dir="$REPORT_REPO/reports/codex-claude-bridge"
+    if [ -d "$report_dir" ]; then
+      latest_report="$(find "$report_dir" -type f -name '*.md' ! -name '._*' 2>/dev/null | sort | tail -n 1 || true)"
+      report_count="$(find "$report_dir" -type f -name '*.md' ! -name '._*' 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
+    fi
+  fi
+  if [ "$output_json" -eq 1 ]; then
+    BRIDGE_VERSION="$VERSION" BRIDGE_PATH="$CODEX_HOME_DIR/bin/codex-claude-bridge" BRIDGE_LOG_FILE="$LOG_FILE" BRIDGE_REPORT_REPO="$REPORT_REPO" BRIDGE_LATEST_REPORT="$latest_report" BRIDGE_REPORT_COUNT="${report_count:-0}" BRIDGE_ACTIVE="$active" BRIDGE_LATEST_LOG="$latest_log" python3 - <<'PY'
+import json
+import os
+latest_log = os.environ.get("BRIDGE_LATEST_LOG", "")
+try:
+    latest = json.loads(latest_log) if latest_log.strip() else None
+except Exception:
+    latest = {"raw": latest_log}
+payload = {
+    "bridge": "codex-claude-bridge",
+    "version": os.environ["BRIDGE_VERSION"],
+    "path": os.environ["BRIDGE_PATH"],
+    "log_file": os.environ["BRIDGE_LOG_FILE"],
+    "report_repo": os.environ.get("BRIDGE_REPORT_REPO") or None,
+    "latest_report": os.environ.get("BRIDGE_LATEST_REPORT") or None,
+    "report_count": int(os.environ.get("BRIDGE_REPORT_COUNT") or 0),
+    "active_processes": [line for line in os.environ.get("BRIDGE_ACTIVE", "").splitlines() if line.strip()],
+    "latest_log": latest,
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+  else
+    printf 'codex-claude-bridge %s\npath: %s\nlog: %s\n' "$VERSION" "$CODEX_HOME_DIR/bin/codex-claude-bridge" "$LOG_FILE"
+    printf 'report repo: %s\nreports: %s\n' "${REPORT_REPO:-not configured}" "${report_count:-0}"
+    [ -n "$latest_report" ] && printf 'latest report: %s\n' "$latest_report"
+    printf '\nactive processes:\n%s\n\nlatest log:\n%s\n' "${active:-none}" "${latest_log:-none}"
+  fi
+}
+
+run_last() {
+  local output_json=0 result_only=0 latest_log
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) output_json=1; shift ;;
+      --result-only) result_only=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown last option: $1" ;;
+    esac
+  done
+  latest_log="$(tail -n 1 "$LOG_FILE" 2>/dev/null || true)"
+  [ -n "$latest_log" ] || die "no bridge log found: $LOG_FILE"
+  if [ "$output_json" -eq 1 ]; then
+    printf '%s\n' "$latest_log" | python3 -m json.tool
+  elif [ "$result_only" -eq 1 ]; then
+    BRIDGE_LATEST_LOG="$latest_log" python3 - <<'PY'
+import json
+import os
+print(json.loads(os.environ["BRIDGE_LATEST_LOG"]).get("result", ""))
+PY
+  else
+    BRIDGE_LATEST_LOG="$latest_log" python3 - <<'PY'
+import json
+import os
+data = json.loads(os.environ["BRIDGE_LATEST_LOG"])
+print(f"{data.get('ts')} {data.get('command')} mode={data.get('mode')} model={data.get('model_requested')} status={data.get('exit_status')} cost={data.get('claude_total_cost_usd')}")
+print(data.get("result", ""))
+PY
+  fi
+}
+
+run_bridge() {
+  local command_name="$1" mode model effort cwd output_json report_log claude_timeout
+  shift
+  mode="$(default_mode_for "$command_name")"
+  model="auto"
+  effort="auto"
+  cwd="$(pwd)"
+  output_json=0
+  report_log=1
+  claude_timeout="$DEFAULT_CLAUDE_TIMEOUT_SEC"
+  local add_dirs=() prompt_args=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --mode) mode="${2:-}"; [ -n "$mode" ] || die "--mode requires a value"; shift 2 ;;
+      --model) model="${2:-}"; [ -n "$model" ] || die "--model requires a value"; shift 2 ;;
+      --effort) effort="${2:-}"; [ -n "$effort" ] || die "--effort requires a value"; shift 2 ;;
+      --cwd) cwd="${2:-}"; [ -n "$cwd" ] || die "--cwd requires a path"; shift 2 ;;
+      --timeout-sec) claude_timeout="${2:-}"; validate_seconds timeout-sec "$claude_timeout"; shift 2 ;;
+      --report-timeout-sec) REPORT_TIMEOUT_SEC="${2:-}"; validate_seconds report-timeout-sec "$REPORT_TIMEOUT_SEC"; shift 2 ;;
+      --add-dir) [ -n "${2:-}" ] || die "--add-dir requires a path"; add_dirs+=("$2"); shift 2 ;;
+      --json) output_json=1; shift ;;
+      --no-report-log) report_log=0; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; prompt_args+=("$@"); break ;;
+      --*) die "unknown option: $1" ;;
+      *) prompt_args+=("$1"); shift ;;
+    esac
+  done
+  validate_choice mode "$mode" "consult review delegate"
+  validate_choice model "$model" "auto haiku sonnet opus"
+  validate_choice effort "$effort" "auto low medium high max"
+  [ -d "$cwd" ] || die "cwd does not exist: $cwd"
+  need_cmd claude
+  need_cmd python3
+  local prompt chosen_model chosen_effort final_prompt effective_timeout out_file err_file prompt_file status started_at ended_at
+  prompt="$(read_prompt "${prompt_args[@]}")"
+  [ -n "${prompt//[[:space:]]/}" ] || die "prompt is required"
+  chosen_model="$(choose_model "$model" "$command_name" "$mode" "$prompt")"
+  chosen_effort="$(choose_effort "$effort" "$command_name" "$mode" "$chosen_model" "$prompt")"
+  effective_timeout="$(effective_claude_timeout "$claude_timeout" "$command_name")"
+  final_prompt="$(build_prompt "$command_name" "$mode" "$cwd" "$prompt")"
+  local claude_args=()
+  claude_args+=(-p --output-format json --no-session-persistence)
+  claude_args+=(--model "$chosen_model" --effort "$chosen_effort")
+  claude_args+=(--append-system-prompt "You are a secondary assistant called by Codex. Codex is primary. Keep output concrete, bounded, and auditable.")
+  while IFS= read -r -d '' arg; do
+    claude_args+=("$arg")
+  done < <(claude_tool_args "$mode")
+  if [ "${#add_dirs[@]}" -gt 0 ]; then
+    local dir
+    for dir in "${add_dirs[@]}"; do
+      claude_args+=(--add-dir "$dir")
+    done
+  fi
+  out_file="$(mktemp "${TMPDIR:-/tmp}/codex-claude-bridge.XXXXXX.json")"
+  err_file="$(mktemp "${TMPDIR:-/tmp}/codex-claude-bridge.XXXXXX.err")"
+  prompt_file="$(mktemp "${TMPDIR:-/tmp}/codex-claude-bridge-prompt.XXXXXX.txt")"
+  printf '%s\n' "$final_prompt" > "$prompt_file"
+  started_at="$(now_utc)"
+  status=0
+  if [ "$effective_timeout" != "$claude_timeout" ]; then
+    printf 'Adjusted trade-review timeout from %s to %s seconds.\n' "$claude_timeout" "$effective_timeout" >> "$err_file"
+  fi
+  run_with_stdin_timeout "$effective_timeout" "$prompt_file" "$out_file" "$err_file" "$cwd" claude "${claude_args[@]}" || status=$?
+  ended_at="$(now_utc)"
+  write_local_log "$out_file" "$err_file" "$status" "$command_name" "$mode" "$chosen_model" "$chosen_effort" "$cwd" "$prompt" "$started_at" "$ended_at" || true
+  if [ "$report_log" -eq 1 ]; then
+    write_report_log "$out_file" "$err_file" "$status" "$command_name" "$mode" "$chosen_model" "$chosen_effort" "$cwd" "$prompt" "$started_at" "$ended_at" || true
+  fi
+  if [ "$output_json" -eq 1 ]; then
+    emit_bridge_json "$out_file" "$err_file" "$status" "$command_name" "$mode" "$chosen_model" "$chosen_effort" "$cwd" "$started_at" "$ended_at"
+  else
+    emit_plain_result "$out_file" "$err_file" "$status"
+  fi
+  rm -f "$out_file" "$err_file" "$prompt_file"
+  return "$status"
+}
+
+main() {
+  local command_name="${1:-}"
+  case "$command_name" in
+    ask|review|trade-review) shift; run_bridge "$command_name" "$@" ;;
+    doctor) shift; run_doctor "$@" ;;
+    status) shift; run_status "$@" ;;
+    last) shift; run_last "$@" ;;
+    -h|--help|help) usage ;;
+    "") usage; exit 2 ;;
+    *) die "unknown subcommand: $command_name" ;;
+  esac
+}
+
+main "$@"

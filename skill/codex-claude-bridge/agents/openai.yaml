@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex Claude Bridge"
+  short_description: "Call Claude as a safe Codex副腦"
+  default_prompt: "Use $codex-claude-bridge to ask Claude for a bounded second opinion while Codex remains primary."
+policy:
+  allow_implicit_invocation: true
