@@ -5,12 +5,16 @@
 > 派工、工作副本、驗收都在 OS 這一層，方向也不只單向。
 > 協作主線請看 **TATWO OS 2.0 公開版**：https://github.com/tatwo214/TATWO-ULTRAWORK-beta
 >
-> **那為什麼還留著？** 因為 OS 的派工需要 App 開著（走 App 持有的 socket），
-> 而這支是純命令列工具，在 headless 的 Codex session、`codex exec`、排程裡仍然可用。
-> 上游正在讓 OS 長出同樣的 headless 入口（三家引擎、同一份稽核格式）；
-> 接上之後這個倉庫會封存，屆時會在這裡再標一次。
+> **接替它的東西已經上線（2026-09-09）：** TATWO OS 長出了同樣的 headless 入口
+> `Engines/cli/tatwo-engine.mjs`——不需要 App，三家引擎（codex／claude／grok）都能當被問的一方，
+> 離開碼與稽核欄位刻意沿用本專案的格式，兩邊紀錄可以合起來算成功率。
+> 因此**本倉庫自即日起封存**，不再更新。
 >
-> 使用量供參：本機稽核紀錄 802 次呼叫、95% 成功（2026-04～09），仍在使用中。
+> 一個新入口沒有沿用的地方要說清楚：本專案的 `review` 是靠傳工具白名單給 Claude CLI；
+> 新入口改用引擎 sidecar 自己的原生唯讀模式，並且**對無法強制唯讀的引擎直接拒絕啟動**。
+> 原因是實測發現「靠攔截權限詢問來擋」是 fail-open 的——引擎可以不問就直接寫檔。
+>
+> 歷史使用量：802 次呼叫、95% 成功（2026-04～2026-09）。程式碼保留供對照與回滾。
 >
 > ---
 >
@@ -19,10 +23,15 @@
 > interchangeable engine layer, with dispatch, worktrees and acceptance handled above them.
 > See https://github.com/tatwo214/TATWO-ULTRAWORK-beta
 >
-> **Why it is still here:** OS dispatch needs the App running (it goes through a socket the App
-> owns). This tool is pure CLI and still works in headless Codex sessions, `codex exec`, and cron.
-> Upstream is growing an equivalent headless entry point for the OS; this repository will be
-> archived once that lands, and the note here will be updated at that time.
+> **Superseded and archived on 2026-09-09.** TATWO OS now ships an equivalent headless entry
+> point (`Engines/cli/tatwo-engine.mjs`): no App required, all three engines can be the one being
+> asked, and it deliberately reuses this project's exit codes and audit fields so both logs can be
+> counted together. One thing it does *not* carry over: this project restricted `review` by passing
+> a tool allowlist to the Claude CLI, whereas the new entry point uses each sidecar's own native
+> read-only mode and refuses to start for engines that cannot enforce it — testing showed that
+> intercepting permission prompts is fail-open, because an engine can simply not ask.
+>
+> Historical usage: 802 calls, 95% success (2026-04 to 2026-09). Code kept for reference and rollback.
 
 # Codex Claude Bridge
 
