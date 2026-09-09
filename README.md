@@ -1,3 +1,29 @@
+> [!NOTE]
+> **定位（2026-09-09）：這是單向的 Codex→Claude 副審通道，不是多模型協作框架。**
+>
+> 它做的事在 TATWO OS 裡已經一般化了：OS 把 codex／claude／grok 當同一層可替換的執行介面，
+> 派工、工作副本、驗收都在 OS 這一層，方向也不只單向。
+> 協作主線請看 **TATWO OS 2.0 公開版**：https://github.com/tatwo214/TATWO-ULTRAWORK-beta
+>
+> **那為什麼還留著？** 因為 OS 的派工需要 App 開著（走 App 持有的 socket），
+> 而這支是純命令列工具，在 headless 的 Codex session、`codex exec`、排程裡仍然可用。
+> 上游正在讓 OS 長出同樣的 headless 入口（三家引擎、同一份稽核格式）；
+> 接上之後這個倉庫會封存，屆時會在這裡再標一次。
+>
+> 使用量供參：本機稽核紀錄 802 次呼叫、95% 成功（2026-04～09），仍在使用中。
+>
+> ---
+>
+> **Scope (2026-09-09): this is a one-way Codex→Claude review channel, not a multi-model
+> collaboration framework.** TATWO OS generalises the same idea — codex/claude/grok as one
+> interchangeable engine layer, with dispatch, worktrees and acceptance handled above them.
+> See https://github.com/tatwo214/TATWO-ULTRAWORK-beta
+>
+> **Why it is still here:** OS dispatch needs the App running (it goes through a socket the App
+> owns). This tool is pure CLI and still works in headless Codex sessions, `codex exec`, and cron.
+> Upstream is growing an equivalent headless entry point for the OS; this repository will be
+> archived once that lands, and the note here will be updated at that time.
+
 # Codex Claude Bridge
 
 Codex Claude Bridge lets Codex call Claude as a secondary verifier, reviewer, or risk critic while keeping Codex as the primary operator.
